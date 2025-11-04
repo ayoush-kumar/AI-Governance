@@ -1,28 +1,28 @@
-Streamlit Web Application
-=========================
-This is a simple web application built using Python 3.10 and Streamlit.
+AI Governance - Streamlit Web Application
+========================================
+This repository contains a Streamlit-based AI Governance dashboard and automation prototype built using Python 3.10.
 
 Requirements
 ------------
 - Python 3.10
-- pip package manager
+- pip (Python package manager)
 - Git (optional)
 
 Installation & Setup
 --------------------
-1. Clone the Repository
+1. Clone the Repository:
    git clone https://github.com/ayoush-kumar/AI-Governance.git
    cd AI-Governance
 
 2. Create a Virtual Environment (Python 3.10)
 
    Mac / Linux:
-   python3.10 -m venv venv
-   source venv/bin/activate
+      python3.10 -m venv venv
+      source venv/bin/activate
 
    Windows:
-   py -3.10 -m venv venv
-   venv\Scripts\activate
+      py -3.10 -m venv venv
+      venv\Scripts\activate
 
 3. Install Dependencies:
    pip install --upgrade pip
@@ -30,13 +30,13 @@ Installation & Setup
 
 Running the Application
 -----------------------
-Start the Streamlit server:
-   streamlit run app.py
+Start the Streamlit app:
+   streamlit run main.py
 
-Replace app.py with your script name if different.
+*If your entry file changes (e.g., dashboard_streamlit.py), replace main.py accordingly.*
 
-Project Structure (Example)
----------------------------
+Project Structure
+-----------------
 .
 ├── Dashboard
 │   └── dashboard_streamlit.py
@@ -56,9 +56,9 @@ Virtual Environment Commands
 Deactivate environment:
    deactivate
 
-If new libraries are installed, update requirements:
+Update requirements after installing new packages:
    pip freeze > requirements.txt
 
 Contribution
 ------------
-Feel free to submit issues or pull requests.
+Feel free to submit issues or pull requests. Improvements & feedback are welcome!
