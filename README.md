@@ -35,21 +35,22 @@ Start the Streamlit app:
 
 *If your entry file changes (e.g., dashboard_streamlit.py), replace main.py accordingly.*
 
-Project Structure
------------------
-.
-├── Dashboard
+## Project Structure
+```
+AI-Governance/
+├── Dashboard/
 │   └── dashboard_streamlit.py
-├── governance_prototype
+├── governance_prototype/
 │   ├── feature_importance.csv
 │   ├── predictions.csv
 │   ├── sla_breach_model.joblib
 │   └── synthetic_tickets.csv
-├── main.py
-├── module
+├── module/
 │   └── hackathonpipeline.py
-├── README.md
-└── requirements.txt
+├── main.py
+├── requirements.txt
+└── README.md
+```
 
 Virtual Environment Commands
 ----------------------------
