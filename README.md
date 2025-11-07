@@ -5,6 +5,9 @@ This repository contains a Streamlit-based AI Governance dashboard and automatio
 ## Overview
 The **AI-Powered Governance Platform** leverages predictive analytics and real-time insights to proactively manage citizen service requests, predict potential service disruptions, and optimize resource allocation across various public departments. The platform integrates real-time data, AI models, and dynamic prioritization to enable government officials to address issues before they escalate, improving the efficiency and responsiveness of public services.
 
+## Project Architecture
+<img width="2282" height="1592" alt="diagram" src="https://github.com/user-attachments/assets/7d15c167-6409-4136-bc18-38a90d5dae91" />
+
 ## Key Features
 - **Predictive Analytics**: AI models forecast SLA breaches, identify service bottlenecks, and assess resource availability.
 - **Real-Time Dashboard**: A Streamlit-based dashboard for visualizing key metrics, SLA breaches, risk analysis, and ticket priority scores.
@@ -109,3 +112,5 @@ Update requirements after installing new packages:
 Contribution
 ------------
 Feel free to submit issues or pull requests. Improvements & feedback are welcome!
+
+
