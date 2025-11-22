@@ -10,7 +10,7 @@ os.chdir(ROOT)  # everything below uses relative paths
 
 # 2) relative script locations
 MODULE_FILE = Path("module/hackathonpipeline.py")
-DASHBOARD_FILE = Path("dashboard/dashboard_streamlit.py")
+DASHBOARD_FILE = Path("Dashboard/dashboard_streamlit.py")
 
 def run_py(path: Path, *args: str) -> None:
     if not path.exists():
@@ -44,4 +44,4 @@ def run_streamlit(path: Path, port: int = 8501, *args: str) -> None:
 if __name__ == "__main__":
     # ensures outputs like governance_prototype/predictions.csv resolve relative to repo root
     run_py(MODULE_FILE)
-    run_streamlit(DASHBOARD_FILE, port=8501)
+    run_streamlit(DASHBOARD_FILE, port=8080)
