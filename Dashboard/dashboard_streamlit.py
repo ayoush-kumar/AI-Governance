@@ -251,34 +251,6 @@ if fdf.empty:
 st.markdown("---")
 
 # ---------- Executive Summary ----------
-# col_left, col_right = st.columns([1, 1])
-
-# with col_left:
-#     st.subheader("Key Findings")
-#     high_risk = fdf[fdf["pred_sla_breach_prob"] > 0.6]
-#     vulnerable_high_risk = high_risk[high_risk["vulnerable_population"] == 1]
-#     top_dept = fdf.groupby("dept")["pred_sla_breach_prob"].mean().idxmax() if len(fdf) > 0 else "N/A"
-#     worst_district = fdf.groupby("district")["sla_breach"].mean().idxmax() if len(fdf) > 0 else "N/A"
-
-#     st.markdown(f"""
-#     - **{len(high_risk):,} tickets** classified as high-risk (>60% breach probability)
-#     - **{len(vulnerable_high_risk)} vulnerable households** require urgent attention
-#     - **Highest risk department:** {top_dept}
-#     - **Underperforming district:** {worst_district}
-#     """)
-
-# with col_right:
-#     st.subheader("Recommended Actions")
-#     action_count = min(50, len(high_risk))
-#     top_category = fdf["category"].mode()[0] if len(fdf) > 0 else "N/A"
-#     top_district_risk = fdf.groupby("district")["pred_sla_breach_prob"].mean().idxmax() if len(fdf) > 0 else "N/A"
-
-#     st.markdown(f"""
-#     - Prioritize **{action_count}** high-risk tickets
-#     - Allocate resources to **{top_district_risk}**
-#     - Address **{top_category}** category issues
-#     """)
-# ---------- Executive Summary ----------
 col_left, col_right = st.columns([1, 1])
 
 
