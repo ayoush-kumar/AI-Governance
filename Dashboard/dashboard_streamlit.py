@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 import numpy as np
 import pandas as pd
 import plotly.express as px
+from datetime import datetime
 import streamlit as st
 
 st.set_page_config(page_title="AI-Governance Platform", layout="wide", page_icon="🏛️")
@@ -184,6 +185,12 @@ if search_text.strip():
 
 fdf = df[mask].copy()
 
+# ---------- SLA Urgency Calculation ----------
+SLA_DEADLINE_HOURS = 72  # 3 days standard SLA
+now = datetime.now()
+fdf["hours_since_creation"] = (now - pd.to_datetime(fdf["created_at"])).dt.total_seconds() / 3600
+fdf["hours_until_breach"] = SLA_DEADLINE_HOURS - fdf["hours_since_creation"]
+
 # ---------- Header ----------
 st.title("AI-Powered Governance Platform: Ministry Control Center")
 st.markdown("**Super Admin Dashboard** | Smart ticket allocation and ministry-level oversight")
@@ -244,33 +251,98 @@ if fdf.empty:
 st.markdown("---")
 
 # ---------- Executive Summary ----------
-col_left, col_right = st.columns([2, 1])
+# col_left, col_right = st.columns([1, 1])
+
+# with col_left:
+#     st.subheader("Key Findings")
+#     high_risk = fdf[fdf["pred_sla_breach_prob"] > 0.6]
+#     vulnerable_high_risk = high_risk[high_risk["vulnerable_population"] == 1]
+#     top_dept = fdf.groupby("dept")["pred_sla_breach_prob"].mean().idxmax() if len(fdf) > 0 else "N/A"
+#     worst_district = fdf.groupby("district")["sla_breach"].mean().idxmax() if len(fdf) > 0 else "N/A"
+
+#     st.markdown(f"""
+#     - **{len(high_risk):,} tickets** classified as high-risk (>60% breach probability)
+#     - **{len(vulnerable_high_risk)} vulnerable households** require urgent attention
+#     - **Highest risk department:** {top_dept}
+#     - **Underperforming district:** {worst_district}
+#     """)
+
+# with col_right:
+#     st.subheader("Recommended Actions")
+#     action_count = min(50, len(high_risk))
+#     top_category = fdf["category"].mode()[0] if len(fdf) > 0 else "N/A"
+#     top_district_risk = fdf.groupby("district")["pred_sla_breach_prob"].mean().idxmax() if len(fdf) > 0 else "N/A"
+
+#     st.markdown(f"""
+#     - Prioritize **{action_count}** high-risk tickets
+#     - Allocate resources to **{top_district_risk}**
+#     - Address **{top_category}** category issues
+#     """)
+# ---------- Executive Summary ----------
+col_left, col_right = st.columns([1, 1])
+
 
 with col_left:
     st.subheader("Key Findings")
-    high_risk = fdf[fdf["pred_sla_breach_prob"] > 0.6]
-    vulnerable_high_risk = high_risk[high_risk["vulnerable_population"] == 1]
+    
+    # Multi-tier risk classification
+    critical_tickets = fdf[
+        (fdf["pred_sla_breach_prob"] > 0.80) & 
+        (fdf["hours_until_breach"] < 24) &
+        (fdf["hours_until_breach"] > 0)
+    ]
+    
+    dire_tickets = fdf[
+        (fdf["pred_sla_breach_prob"] > 0.80) &
+        (fdf["hours_until_breach"].between(24, 72))
+    ]
+    
+    high_risk = fdf[(fdf["pred_sla_breach_prob"] > 0.60) & (fdf["pred_sla_breach_prob"] <= 0.80)]
+    
+    vulnerable_critical = critical_tickets[critical_tickets["vulnerable_population"] == 1]
     top_dept = fdf.groupby("dept")["pred_sla_breach_prob"].mean().idxmax() if len(fdf) > 0 else "N/A"
     worst_district = fdf.groupby("district")["sla_breach"].mean().idxmax() if len(fdf) > 0 else "N/A"
 
     st.markdown(f"""
-    - **{len(high_risk):,} tickets** classified as high-risk (>60% breach probability)
-    - **{len(vulnerable_high_risk)} vulnerable households** require urgent attention
+    - **{len(critical_tickets):,} critical tickets** (<24hrs to SLA breach + >80% risk)
+    - **{len(vulnerable_critical)} vulnerable households** in critical tier
+    - **{len(dire_tickets):,} dire tickets** (24-72hrs window + >80% risk)
     - **Highest risk department:** {top_dept}
     - **Underperforming district:** {worst_district}
     """)
 
+
 with col_right:
     st.subheader("Recommended Actions")
-    action_count = min(50, len(high_risk))
+    
     top_category = fdf["category"].mode()[0] if len(fdf) > 0 else "N/A"
     top_district_risk = fdf.groupby("district")["pred_sla_breach_prob"].mean().idxmax() if len(fdf) > 0 else "N/A"
-
+    
     st.markdown(f"""
-    1. Prioritize **{action_count}** high-risk tickets
-    2. Allocate resources to **{top_district_risk}**
-    3. Address **{top_category}** category issues
+    - **CRITICAL:** Resolve {len(critical_tickets)} tickets immediately (<24hrs)
+    - **DIRE:** Prioritize {len(dire_tickets)} tickets within 48 hours
+    - **ELEVATED:** Proactively address {len(high_risk)} tickets this week
+    - **Focus areas:** {top_district_risk} district, {top_category} category
     """)
+    
+    # Smart multi-tier capacity alert
+    if len(critical_tickets) > 50:
+        st.error(f"CRISIS MODE: {len(critical_tickets)} critical tickets exceed emergency capacity. Immediate action required.")
+    elif len(critical_tickets) > 20:
+        st.error(f"HIGH ALERT: {len(critical_tickets)} critical tickets require immediate resolution.")
+    elif len(critical_tickets) > 0:
+        st.warning(f"URGENT: {len(critical_tickets)} tickets breach SLA within 24 hours.")
+    elif len(dire_tickets) > 50:
+        st.warning(f"ELEVATED ALERT: {len(dire_tickets)} dire tickets need prioritization within 48 hours.")
+    elif len(dire_tickets) > 0:
+        st.info(f"ATTENTION: {len(dire_tickets)} dire tickets require action within 48-72 hours.")
+    elif len(high_risk) > 30:
+        st.info(f"PROACTIVE MODE: {len(high_risk)} elevated-risk tickets need weekly planning.")
+    elif len(high_risk) > 0:
+        st.success(f" STABLE: {len(high_risk)} elevated tickets identified for proactive resolution.")
+    else:
+        st.success(" OPTIMAL: No urgent tickets. System operating at baseline.")
+
 
 st.markdown("---")
 
