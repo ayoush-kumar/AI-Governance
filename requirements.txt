@@ -3,3 +3,8 @@ pandas==2.3.3
 plotly==5.24.1
 scikit-learn
 joblib
+google-cloud-bigquery
+google-cloud-firestore
+google-cloud-aiplatform
+pandas-gbq
+db-dtypes

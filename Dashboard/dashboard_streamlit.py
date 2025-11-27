@@ -1,12 +1,24 @@
 # governance_prototype/dashboard_streamlit.py
 import json
+import uuid
+import time
 from pathlib import Path
 from datetime import datetime, timedelta
 import numpy as np
 import pandas as pd
 import plotly.express as px
-from datetime import datetime
 import streamlit as st
+
+# Google Cloud Libraries
+from google.cloud import bigquery
+from google.cloud import firestore
+import vertexai
+from vertexai.generative_models import GenerativeModel
+
+# Initialize Cloud Clients
+PROJECT_ID = "hackathon-pipeline"
+REGION = "asia-south1"
+db = firestore.Client(project=PROJECT_ID)
 
 st.set_page_config(page_title="AI-Governance Platform", layout="wide", page_icon="🏛️")
 
@@ -64,6 +76,14 @@ GLOSSARY = {
     "festival_season": ("Festival Period", "Issue occurred during major festival season."),
     "historical_backlog": ("Backlog", "Number of pending tickets in this area."),
     "resource_availability": ("Staff Available", "Relative staffing/resources available (0-1 scale)."),
+    # NEW FEATURES FROM UPDATED PIPELINE
+    "escalated": ("Escalated", "Ticket escalated to higher authority (1=Yes, 0=No)."),
+    "escalation_level": ("Escalation Level", "0=None, 1=Supervisor, 2=District Officer, 3=Ministry."),
+    "escalation_days": ("Escalation Time", "Days taken to resolve after escalation."),
+    "created_hour": ("Created Hour", "Hour of day when ticket was created (0-23)."),
+    "is_business_hours": ("Business Hours", "Ticket created during business hours (9 AM - 5 PM)."),
+    "is_weekend": ("Weekend", "Ticket created on weekend (Saturday/Sunday)."),
+    "sla_deadline_hours": ("SLA Deadline", "Department-specific SLA deadline in hours."),
 }
 
 # ---------- Impact Assessment Helper Functions ----------
@@ -240,14 +260,84 @@ def label(term: str) -> str:
 def help_text(term: str) -> str:
     return GLOSSARY.get(term, ("", ""))[1]
 
-# ---------- Data loading ----------
-@st.cache_data
-def load_predictions(path: str) -> pd.DataFrame:
-    df = pd.read_csv(path)
+# ---------- Cloud Data Functions ----------
+@st.cache_data(ttl=300)
+def load_predictions() -> pd.DataFrame:
+    """Load data from BigQuery"""
+    client = bigquery.Client(project=PROJECT_ID)
+    query = f"SELECT * FROM `{PROJECT_ID}.governance_data.predictions`"
+    
+    df = client.query(query).to_dataframe()
+    
+    # Type Conversion
     df["created_at"] = pd.to_datetime(df["created_at"])
     df["pred_sla_breach_prob"] = pd.to_numeric(df["pred_sla_breach_prob"], errors="coerce").clip(0, 1).fillna(0.0)
     df["priority_score"] = pd.to_numeric(df["priority_score"], errors="coerce").clip(0, 100).fillna(0.0)
     return df
+
+def save_assignment_firestore(data):
+    """Save assignment to Firestore"""
+    doc_id = str(uuid.uuid4())
+    data['saved_at'] = firestore.SERVER_TIMESTAMP
+    db.collection('assignments').document(doc_id).set(data)
+
+def get_assignments_firestore():
+    """Fetch history from Firestore"""
+    docs = db.collection('assignments').order_by('saved_at', direction=firestore.Query.DESCENDING).limit(50).stream()
+    return [doc.to_dict() for doc in docs]
+
+def get_gemini_response(query, context_df):
+    """Real Gemini integration via Vertex AI with Enhanced Context"""
+    try:
+        # Initialize Vertex AI (Keep us-central1 for access to newer models)
+        vertexai.init(project=PROJECT_ID, location="us-central1")
+        
+        # Using the model you selected
+        model = GenerativeModel("gemini-2.0-flash-lite-001") 
+        
+        # --- BUILD RICH CONTEXT ---
+        # 1. High-level aggregates
+        total_tickets = len(context_df)
+        avg_risk = context_df['pred_sla_breach_prob'].mean()
+        
+        # 2. Top Distributions (So it knows which districts/depts are active)
+        district_counts = context_df['district'].value_counts().head(5).to_dict()
+        dept_counts = context_df['dept'].value_counts().head(5).to_dict()
+        
+        # 3. Detailed sample of High Risk Tickets (The "Evidence")
+        # We grab the top 25 highest risk tickets so the AI can see specific examples
+        # We convert it to a CSV string so the LLM can read it easily
+        high_risk_data = context_df.sort_values("pred_sla_breach_prob", ascending=False).head(25)
+        # Select only relevant columns to save tokens
+        sample_csv = high_risk_data[['ticket_id', 'district', 'dept', 'category', 'pred_sla_breach_prob', 'sla_breach']].to_string(index=False)
+
+        # Construct the Prompt
+        prompt = f"""
+        You are an intelligent government analyst. You have access to the current live dashboard data.
+        
+        ### DATA SNAPSHOT:
+        - **Total Tickets in View:** {total_tickets}
+        - **Average Breach Risk:** {avg_risk:.1%}
+        - **Top Districts (by volume):** {district_counts}
+        - **Top Departments (by volume):** {dept_counts}
+
+        ### TOP 25 CRITICAL TICKETS (Sample Data):
+        {sample_csv}
+
+        ### USER QUERY:
+        "{query}"
+
+        ### INSTRUCTIONS:
+        1. Answer strictly based on the provided data above.
+        2. If the user asks about a specific city (like Mumbai), look at the 'district' column in the sample data.
+        3. Identify patterns (e.g., "Most critical water issues are in Mumbai City").
+        4. Be concise and professional.
+        """
+        
+        response = model.generate_content(prompt)
+        return response.text
+    except Exception as e:
+        return f"⚠️ AI Error: {str(e)}"
 
 def compute_dynamic_priority(df: pd.DataFrame, w: dict) -> pd.Series:
     ws = np.array([w["risk"], w["severity"], w["vuln"], w["sent"], w["fest"]], dtype=float)
@@ -278,8 +368,9 @@ def color_risk(val):
     else:
         return 'background-color: #FFB6C1'
 
-DATA_PATH = "governance_prototype/predictions.csv"
-df = load_predictions(DATA_PATH)
+# DATA_PATH = "governance_prototype/predictions.csv"
+# df = load_predictions(DATA_PATH)
+df = load_predictions()
 
 # ---------- Sidebar filters ----------
 st.sidebar.title("Filters & Scenarios")
@@ -338,6 +429,14 @@ severity_min = st.sidebar.select_slider(label("severity"), options=[1, 2, 3], va
 prob_min, prob_max = st.sidebar.slider(label("pred_sla_breach_prob") + " Range", 0.0, 1.0, (0.0, 1.0), 0.01, help=help_text("pred_sla_breach_prob"))
 prio_min, prio_max = st.sidebar.slider(label("priority_score") + " Range", 0.0, 100.0, (0.0, 100.0), 1.0, help=help_text("priority_score"))
 
+st.sidebar.subheader("Escalation Status")
+escalation_filter = st.sidebar.multiselect(
+    "Escalation Level",
+    ["Not Escalated", "Supervisor", "District Officer", "Ministry"],
+    placeholder="All escalation levels",
+    help="Filter by escalation status"
+)
+
 st.sidebar.subheader("Search")
 search_text = st.sidebar.text_input("Search tickets", "", placeholder="Ticket ID, category, or ward")
 
@@ -347,8 +446,14 @@ st.sidebar.markdown("""
 - **Low:** <20%  
 - **Medium:** 20-30%  
 - **High:** >30%
-""")
 
+**Department SLA Deadlines:**  
+- **Health:** 7 days (168 hrs)  
+- **Safety:** 7 days (168 hrs)  
+- **Water:** 10 days (240 hrs)  
+- **Roads:** 15 days (360 hrs)  
+- **Education:** 30 days (720 hrs)
+""")
 # ---------- Apply scenario presets ----------
 mask = (
     (df["created_at"].dt.date >= date_range[0])
@@ -390,14 +495,28 @@ if search_text.strip():
         | df["ward"].fillna("").str.lower().str.contains(s, na=False)
     )
 
+# Apply escalation filter
+if escalation_filter:
+    escalation_map = {"Not Escalated": 0, "Supervisor": 1, "District Officer": 2, "Ministry": 3}
+    escalation_nums = [escalation_map[e] for e in escalation_filter]
+    if "escalation_level" in df.columns:
+        mask &= df["escalation_level"].isin(escalation_nums)
+
 fdf = df[mask].copy()
 
+
 # ---------- SLA Urgency Calculation ----------
-SLA_DEADLINE_HOURS = 72  # 3 days standard SLA
 now = datetime.now()
 fdf["hours_since_creation"] = (now - pd.to_datetime(fdf["created_at"])).dt.total_seconds() / 3600
-fdf["hours_until_breach"] = SLA_DEADLINE_HOURS - fdf["hours_since_creation"]
+
+# Calculate hours until breach using department-specific SLA from data
+fdf["hours_until_breach"] = fdf["sla_deadline_hours"] - fdf["hours_since_creation"]
 fdf["already_breached"] = fdf["hours_until_breach"] < 0
+
+# Also calculate urgency using 72-hour action window for immediate prioritization
+fdf["hours_until_urgent"] = 72 - fdf["hours_since_creation"]
+fdf["is_urgent_72h"] = (fdf["hours_until_urgent"] > 0) & (fdf["hours_until_urgent"] < 72)
+
 
 # ---------- Header ----------
 st.title("AI-Powered Governance Platform: Ministry Control Center")
@@ -405,7 +524,8 @@ st.markdown("**Super Admin Dashboard** | Smart ticket allocation and ministry-le
 st.markdown("---")
 
 # ---------- KPIs ----------
-col1, col2, col3, col4, col5 = st.columns(5)
+col1, col2, col3, col4, col5, col6 = st.columns(6)
+
 
 with col1:
     st.metric(
@@ -452,6 +572,17 @@ with col5:
         help=help_text("historical_backlog")
     )
 
+with col6:
+    escalation_rate = fdf["escalated"].mean() if len(fdf) and "escalated" in fdf.columns else 0
+    esc_status = "HIGH" if escalation_rate > 0.40 else "NORMAL"
+    st.metric(
+        label="Escalation Rate",
+        value=f"{escalation_rate:.1%}",
+        delta=esc_status,
+        delta_color="inverse" if escalation_rate > 0.40 else "off",
+        help="Percentage of tickets escalated to higher authority"
+    )
+
 if fdf.empty:
     st.warning("No records match the current filters. Please adjust your selection.")
     st.stop()
@@ -488,12 +619,19 @@ with col_left:
     vulnerable_total = len(fdf[fdf["vulnerable_population"] == 1])
     
     num_depts = len(fdf["dept"].unique())
+    
+    # Calculate escalation stats
+    escalated_tickets = fdf[fdf["escalated"] == 1] if "escalated" in fdf.columns else pd.DataFrame()
+    escalated_critical = critical_tickets[critical_tickets["escalated"] == 1] if "escalated" in critical_tickets.columns else pd.DataFrame()
+    urgent_72h = fdf[(fdf["pred_sla_breach_prob"] > 0.60) & (fdf["is_urgent_72h"] == True)] if "is_urgent_72h" in fdf.columns else pd.DataFrame()
+    
     st.markdown(f"""
     **System-wide ({len(fdf)} tickets, {num_depts} departments):**
-    - **{len(already_breached_tickets):,} tickets ALREADY BREACHED** (SLA deadline passed)
+    - **{len(already_breached_tickets):,} tickets ALREADY BREACHED** (dept-specific SLA passed)
     - **{len(critical_tickets):,} critical tickets** (<24hrs to breach + >80% risk)
+    - **{len(escalated_tickets):,} escalated tickets** ({len(escalated_critical):,} critical escalations)
     - **{len(vulnerable_critical)} vulnerable households** in critical tier ({vulnerable_total} total)
-    - **{len(dire_tickets):,} dire tickets** (24-72hrs window + >80% risk)
+    - **{len(urgent_72h):,} urgent for 72h action window** (>60% risk, not yet breached)
     - **Highest risk department:** {top_dept}
     - **Underperforming district:** {worst_district}
     """)
@@ -534,12 +672,13 @@ with col_right:
 st.markdown("---")
 
 # ---------- Tabs ----------
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "Distribution Analysis",
     "Trend Analysis",
     "Impact Assessment",
     "Action Queue",
-    "Monitoring & Oversight"
+    "Monitoring & Oversight",
+    "Gemini Assistant"
 ])
 
 # ====== Tab 1: Distribution Analysis ======
@@ -569,7 +708,7 @@ with tab1:
                 color_continuous_scale=["green", "yellow", "red"]
             )
             fig_ward.update_layout(showlegend=False, xaxis_tickangle=-45)
-            st.plotly_chart(fig_ward, use_container_width=True, key="ward_risk_breakdown")
+            st.plotly_chart(fig_ward, width='content', key="ward_risk_breakdown")
         else:
             st.warning("No data available for selected wards")
 
@@ -599,7 +738,7 @@ with tab1:
                 color_continuous_scale=["green", "yellow", "red"]
             )
             fig1.update_layout(showlegend=False, xaxis_tickangle=-45)
-            st.plotly_chart(fig1, use_container_width=True, key="district_risk_chart")
+            st.plotly_chart(fig1, width='content', key="district_risk_chart")
         else:
             st.info("No district data available with current filters")
 
@@ -623,7 +762,7 @@ with tab1:
                 color_continuous_scale=["green", "yellow", "red"]
             )
             fig2.update_layout(showlegend=False)
-            st.plotly_chart(fig2, use_container_width=True, key="dept_risk_chart")
+            st.plotly_chart(fig2, width='content', key="dept_risk_chart")
         else:
             st.info("No department data available with current filters")
 
@@ -663,17 +802,18 @@ with tab1:
         )
 
     fig3.update_layout(height=500)
-    st.plotly_chart(fig3, use_container_width=True,  key="category_scatter_chart")
+    st.plotly_chart(fig3, width='content',  key="category_scatter_chart")
 
 # ====== Tab 2: Trend Analysis ======
 with tab2:
     st.subheader("Temporal Patterns and Trends")
 
-    fdf["day"] = fdf["created_at"].dt.date
-    daily = (
-        fdf.groupby("day", as_index=False)
-        .agg(tickets=("ticket_id", "count"), risk=("pred_sla_breach_prob", "mean"), breaches=("sla_breach", "mean"))
-        .sort_values("day")
+    fdf_tab2 = fdf.copy()
+    fdf_tab2["day"] = fdf_tab2["created_at"].dt.date
+    daily = fdf_tab2.groupby("day", as_index=False).agg(
+        tickets=("ticket_id", "count"),
+        risk=("pred_sla_breach_prob", "mean"),
+        breaches=("sla_breach", "mean")
     )
 
     t1, t2 = st.columns(2)
@@ -695,7 +835,7 @@ with tab2:
                 labels={"day": "Date", "tickets": "Tickets"}
             )
             fig5.update_traces(line_color="#1f77b4")
-            st.plotly_chart(fig5, use_container_width=True, key="daily_volume_chart")
+            st.plotly_chart(fig5, width='content', key="daily_volume_chart")
         else:
             st.info("No trend data available with current filters")
 
@@ -710,25 +850,248 @@ with tab2:
             )
             fig6.update_traces(name="AI Predicted Risk", selector=dict(name="risk"))
             fig6.update_traces(name="Actual Breaches", selector=dict(name="breaches"))
-            st.plotly_chart(fig6, use_container_width=True, key="model_accuracy_chart")
+            st.plotly_chart(fig6, width='content', key="model_accuracy_chart")
         else:
             st.info("No trend data available with current filters")
 
+    st.markdown("---")
+    st.markdown("### Escalation Analysis")
+    
+    if "escalation_level" in fdf.columns:
+        esc_col1, esc_col2 = st.columns(2)
+        
+        with esc_col1:
+            st.markdown("#### Escalation Funnel")
+            
+            # Count tickets at each escalation level
+            esc_counts = fdf["escalation_level"].value_counts().sort_index()
+            esc_labels = ["Not Escalated", "Supervisor", "District Officer", "Ministry"]
+            esc_data = pd.DataFrame({
+                "Level": [esc_labels[min(i, 3)] for i in esc_counts.index],
+                "Count": esc_counts.values
+            })
+            
+            # Create funnel chart
+            fig_esc = px.funnel(
+                esc_data,
+                y="Level",
+                x="Count",
+                title="Ticket Escalation Funnel"
+            )
+            fig_esc.update_layout(height=400)
+            st.plotly_chart(fig_esc, width='content', key="escalation_funnel_chart")
+            
+            # Show escalation rate
+            esc_rate = (len(fdf[fdf["escalation_level"] > 0]) / len(fdf) * 100) if len(fdf) > 0 else 0
+            st.caption(f"📊 {esc_rate:.1f}% of tickets escalated beyond initial level")
+        
+        with esc_col2:
+            st.markdown("#### Impact on Resolution Time")
+            
+            # Calculate resolution time by escalation level
+            esc_impact = fdf.groupby("escalation_level").agg({
+                "resolution_hours": "mean",
+                "sla_breach": "mean",
+                "ticket_id": "count"
+            }).reset_index()
+            
+            # Map numeric levels to labels
+            esc_impact["Level"] = esc_impact["escalation_level"].map({
+                0: "None", 
+                1: "Supervisor", 
+                2: "District", 
+                3: "Ministry"
+            })
+            
+            # Create bar chart showing resolution time
+            fig_esc_impact = px.bar(
+                esc_impact,
+                x="Level",
+                y="resolution_hours",
+                title="Average Resolution Time by Escalation Level",
+                labels={"resolution_hours": "Avg Resolution (hours)", "Level": "Escalation Level"},
+                color="sla_breach",
+                color_continuous_scale=["green", "red"],
+                text="ticket_id"
+            )
+            fig_esc_impact.update_traces(
+                texttemplate='%{text} tickets', 
+                textposition='outside'
+            )
+            fig_esc_impact.update_layout(height=400)
+            st.plotly_chart(fig_esc_impact, width='content', key="escalation_impact_chart")
+            
+            # Show insight
+            if len(esc_impact) > 1:
+                fastest_level = esc_impact.loc[esc_impact["resolution_hours"].idxmin(), "Level"]
+                st.caption(f"⚡ Fastest resolution: {fastest_level} escalation level")
+    else:
+        st.info("ℹ️ Escalation data not available in current dataset. Run updated pipeline to see escalation analysis.")
+    
+    st.markdown("---")
+    # ========== END NEW SECTION ==========
+    
     st.markdown("### Weekly Department Trends")
-    fdf["week"] = fdf["created_at"].dt.to_period("W").dt.start_time
+    fdf_tab2["week"] = fdf_tab2["created_at"].dt.to_period("W").dt.start_time
+    
+    # CREATE THE MISSING weekly_dept DATAFRAME
     weekly_dept = (
-        fdf.groupby(["week", "dept"], as_index=False)["ticket_id"]
+        fdf_tab2.groupby(["week", "dept"], as_index=False)["ticket_id"]
         .count().rename(columns={"ticket_id": "tickets"}).sort_values("week")
     )
+    
     fig7 = px.area(
-        weekly_dept,
+        weekly_dept,  # Now it's defined!
         x="week",
         y="tickets",
         color="dept",
         title="Weekly Ticket Volume by Department",
         labels={"week": "Week Starting", "tickets": "Tickets", "dept": "Department"},
     )
-    st.plotly_chart(fig7, use_container_width=True, key="weekly_dept_trends")
+    st.plotly_chart(fig7, width='content', key="weekly_dept_trends")
+    
+    # ========== NEW SECTION: TIME-OF-DAY PATTERNS ==========
+    st.markdown("---")
+    st.markdown("### Time-of-Day Patterns")
+    
+    if "created_hour" in fdf_tab2.columns and "is_business_hours" in fdf_tab2.columns:
+        tod_col1, tod_col2 = st.columns(2)
+        
+        with tod_col1:
+            st.markdown("#### Hourly Ticket Distribution")
+            
+            # Group tickets by hour of day
+            hourly = fdf_tab2.groupby("created_hour").agg({
+                "ticket_id": "count",
+                "pred_sla_breach_prob": "mean"
+            }).reset_index()
+            hourly.columns = ["Hour", "Tickets", "Avg Risk"]
+            
+            # Create bar chart
+            fig_hour = px.bar(
+                hourly,
+                x="Hour",
+                y="Tickets",
+                title="Ticket Volume by Hour of Day",
+                labels={"Hour": "Hour (0-23)", "Tickets": "Ticket Count"},
+                color="Avg Risk",
+                color_continuous_scale=["green", "yellow", "red"]
+            )
+            fig_hour.update_layout(
+                xaxis=dict(tickmode='linear', tick0=0, dtick=2),  # Show every 2 hours
+                height=400
+            )
+            st.plotly_chart(fig_hour, width='content', key="hourly_volume_chart")
+            
+            # Show peak hour insight
+            peak_hour = hourly.loc[hourly["Tickets"].idxmax(), "Hour"]
+            peak_count = hourly["Tickets"].max()
+            st.caption(f"📈 Peak hour: {int(peak_hour):02d}:00 with {peak_count} tickets")
+        
+        with tod_col2:
+            st.markdown("#### Business Hours Impact")
+            
+            # Compare business hours vs after hours
+            bh_stats = fdf_tab2.groupby("is_business_hours").agg({
+                "ticket_id": "count",
+                "sla_breach": "mean",
+                "resolution_hours": "mean"
+            }).reset_index()
+            
+            # Map 0/1 to readable labels
+            bh_stats["Period"] = bh_stats["is_business_hours"].map({
+                1: "Business Hours\n(9 AM - 5 PM)", 
+                0: "After Hours\n(5 PM - 9 AM)"
+            })
+            
+            # Create bar chart for breach rate
+            fig_bh = px.bar(
+                bh_stats,
+                x="Period",
+                y="sla_breach",
+                title="Breach Rate: Business Hours vs After Hours",
+                labels={"sla_breach": "Breach Rate", "Period": ""},
+                color="sla_breach",
+                color_continuous_scale=["green", "red"],
+                text=bh_stats["ticket_id"]
+            )
+            fig_bh.update_traces(
+                texttemplate='%{text} tickets<br>%{y:.1%} breach', 
+                textposition='outside'
+            )
+            fig_bh.update_layout(
+                showlegend=False,
+                height=400,
+                yaxis=dict(tickformat='.0%')
+            )
+            st.plotly_chart(fig_bh, width='content', key="business_hours_chart")
+            
+            # Show insight
+            if len(bh_stats) == 2:
+                bh_breach = bh_stats[bh_stats["is_business_hours"] == 1]["sla_breach"].values[0]
+                ah_breach = bh_stats[bh_stats["is_business_hours"] == 0]["sla_breach"].values[0]
+                diff = abs(bh_breach - ah_breach)
+                
+                if ah_breach > bh_breach:
+                    st.caption(f"⚠️ After-hours tickets have {diff:.1%} higher breach rate")
+                else:
+                    st.caption(f"✅ Business hours tickets have {diff:.1%} higher breach rate")
+        
+        # Additional weekend analysis
+        st.markdown("---")
+        st.markdown("#### Weekend vs Weekday Comparison")
+        
+        if "is_weekend" in fdf_tab2.columns:
+            weekend_col1, weekend_col2, weekend_col3 = st.columns(3)
+            
+            weekend_stats = fdf_tab2.groupby("is_weekend").agg({
+                "ticket_id": "count",
+                "sla_breach": "mean",
+                "resolution_hours": "mean"
+            }).reset_index()
+            
+            weekend_stats["Day Type"] = weekend_stats["is_weekend"].map({
+                1: "Weekend", 
+                0: "Weekday"
+            })
+            
+            with weekend_col1:
+                weekend_tickets = weekend_stats[weekend_stats["is_weekend"] == 1]["ticket_id"].values[0] if len(weekend_stats[weekend_stats["is_weekend"] == 1]) > 0 else 0
+                weekday_tickets = weekend_stats[weekend_stats["is_weekend"] == 0]["ticket_id"].values[0] if len(weekend_stats[weekend_stats["is_weekend"] == 0]) > 0 else 0
+                weekend_pct = (weekend_tickets / (weekend_tickets + weekday_tickets) * 100) if (weekend_tickets + weekday_tickets) > 0 else 0
+                
+                st.metric(
+                    "Weekend Tickets",
+                    f"{weekend_tickets:,}",
+                    delta=f"{weekend_pct:.1f}% of total"
+                )
+            
+            with weekend_col2:
+                weekend_breach = weekend_stats[weekend_stats["is_weekend"] == 1]["sla_breach"].values[0] if len(weekend_stats[weekend_stats["is_weekend"] == 1]) > 0 else 0
+                weekday_breach = weekend_stats[weekend_stats["is_weekend"] == 0]["sla_breach"].values[0] if len(weekend_stats[weekend_stats["is_weekend"] == 0]) > 0 else 0
+                breach_diff = weekend_breach - weekday_breach
+                
+                st.metric(
+                    "Weekend Breach Rate",
+                    f"{weekend_breach:.1%}",
+                    delta=f"{breach_diff:+.1%} vs weekday",
+                    delta_color="inverse"
+                )
+            
+            with weekend_col3:
+                weekend_res = weekend_stats[weekend_stats["is_weekend"] == 1]["resolution_hours"].values[0] if len(weekend_stats[weekend_stats["is_weekend"] == 1]) > 0 else 0
+                weekday_res = weekend_stats[weekend_stats["is_weekend"] == 0]["resolution_hours"].values[0] if len(weekend_stats[weekend_stats["is_weekend"] == 0]) > 0 else 0
+                res_diff = weekend_res - weekday_res
+                
+                st.metric(
+                    "Weekend Avg Resolution",
+                    f"{weekend_res:.1f} hrs",
+                    delta=f"{res_diff:+.1f} hrs vs weekday",
+                    delta_color="inverse" if res_diff > 0 else "normal"
+                )
+    else:
+        st.info("ℹ️ Time-of-day data not available in current dataset. Run updated pipeline to see temporal analysis.")
+    # ========== END NEW SECTION ==========
 
 # ====== Tab 3: Impact Assessment ======
 with tab3:
@@ -889,7 +1252,7 @@ with tab3:
                 "AI Risk Score": "{:.1%}",
                 "Avg Resolution (hrs)": "{:.1f}"
             })
-        st.dataframe(styled_df, use_container_width=True)
+        st.dataframe(styled_df, width='content')
     else:
         st.warning("No department data available for comparison with current filters")
 
@@ -897,157 +1260,135 @@ with tab3:
 with tab4:
     st.subheader("Priority Queue and Ticket Assignment")
 
-    # Priority weight adjustment
+    # 1. Priority weights
     with st.expander("Adjust Priority Weights", expanded=False):
-        st.markdown("Customize priority scoring based on organizational policy")
         c1, c2, c3, c4, c5 = st.columns(5)
         w = {
-            "risk":    c1.slider("Risk Weight", 0.0, 1.0, 0.50, 0.01, help=help_text("pred_sla_breach_prob")),
-            "severity":c2.slider("Severity Weight", 0.0, 1.0, 0.20, 0.01, help=help_text("severity")),
-            "vuln":    c3.slider("Vulnerability Weight", 0.0, 1.0, 0.15, 0.01, help=help_text("vulnerable_population")),
-            "sent":    c4.slider("Sentiment Weight", 0.0, 1.0, 0.10, 0.01, help=help_text("citizen_sentiment")),
-            "fest":    c5.slider("Festival Weight", 0.0, 1.0, 0.05, 0.01, help=help_text("festival_season")),
+            "risk": c1.slider("Risk Weight", 0.0, 1.0, 0.50, 0.01, key="w_risk"),
+            "severity": c2.slider("Severity Weight", 0.0, 1.0, 0.20, 0.01, key="w_sev"),
+            "vuln": c3.slider("Vulnerability Weight", 0.0, 1.0, 0.15, 0.01, key="w_vuln"),
+            "sent": c4.slider("Sentiment Weight", 0.0, 1.0, 0.10, 0.01, key="w_sent"),
+            "fest": c5.slider("Festival Weight", 0.0, 1.0, 0.05, 0.01, key="w_fest"),
         }
 
-    fdf = fdf.copy()
-    fdf["priority_dynamic"] = compute_dynamic_priority(fdf, w)
-    fdf["ministry_default"] = fdf["dept"].map(MINISTRY_MAP).fillna("Cross-Ministry")
+    # 2. Prepare Data
+    fdf_copy = fdf.copy()
+    fdf_copy["priority_dynamic"] = compute_dynamic_priority(fdf_copy, w)
+    fdf_copy["ministry_default"] = fdf_copy["dept"].map(MINISTRY_MAP).fillna("Cross-Ministry")
 
-    # Editable queue
-    editable = fdf.sort_values(["priority_dynamic", "pred_sla_breach_prob"], ascending=False).copy()
+    # 3. Create Editable DataFrame (The "Old Way" - Simple)
+    # We sort, but we DO NOT try to manually inject previous selections from session state.
+    # We let the data_editor handle the persistence during the run.
+    editable = fdf_copy.sort_values(
+        ["priority_dynamic", "pred_sla_breach_prob"], 
+        ascending=[False, False]
+    )
+    
+    # Initialize columns for the editor
     editable.insert(0, "select", False)
     editable.insert(1, "escalate", False)
     editable.insert(2, "route_dept", editable["dept"])
     editable.insert(3, "route_ministry", editable["ministry_default"])
-    editable["vulnerable_population"] = editable["vulnerable_population"].astype(bool)
 
+    # 4. Column Configuration
     dept_options = sorted(editable["dept"].unique().tolist()) + ["Cross-Department"]
+    
+    col_config = {
+        "select": st.column_config.CheckboxColumn("Select", default=False),
+        "escalate": st.column_config.CheckboxColumn("Escalate", default=False),
+        "route_dept": st.column_config.SelectboxColumn("Dept", options=dept_options),
+        "route_ministry": st.column_config.SelectboxColumn("Ministry", options=MINISTRY_OPTIONS),
+        "pred_sla_breach_prob": st.column_config.NumberColumn("Risk", format="%.0%%"),
+        "priority_dynamic": st.column_config.NumberColumn("Priority", format="%.1f"),
+    }
+    
+    display_cols = [
+        "select", "escalate", "route_dept", "route_ministry",
+        "ticket_id", "created_at", "district", "ward", "dept", 
+        "category", "severity", "vulnerable_population", 
+        "pred_sla_breach_prob", "priority_dynamic", "historical_backlog"
+    ]
 
-    edited = st.data_editor(
-        editable[
-            [
-                "select",
-                "escalate",
-                "route_dept",
-                "route_ministry",
-                "ticket_id",
-                "created_at",
-                "district",
-                "ward",
-                "dept",
-                "category",
-                "severity",
-                "vulnerable_population",
-                "pred_sla_breach_prob",
-                "priority_dynamic",
-                "historical_backlog",
-            ]
-        ].head(100),
+    # 5. Render Data Editor
+    st.markdown("### Ticket Queue")
+    
+    # Using a unique key helps Streamlit maintain state
+    edited_df = st.data_editor(
+        editable[display_cols].head(100),
         hide_index=True,
         use_container_width=True,
-        column_config={
-            "select": st.column_config.CheckboxColumn("Select"),
-            "escalate": st.column_config.CheckboxColumn("Escalate"),
-            "route_dept": st.column_config.SelectboxColumn("Route to Department", options=dept_options),
-            "route_ministry": st.column_config.SelectboxColumn("Route to Ministry", options=MINISTRY_OPTIONS),
-            "created_at": st.column_config.DatetimeColumn("Created Date"),
-            "dept": "Department",
-            "district": "District",
-            "ward": "Ward",
-            "category": "Category",
-            "pred_sla_breach_prob": st.column_config.NumberColumn("Risk Score", format="%.0%%", help=help_text("pred_sla_breach_prob")),
-            "priority_dynamic": st.column_config.NumberColumn("Priority Score", format="%.1f", help=help_text("priority_dynamic")),
-            "severity": st.column_config.NumberColumn("Severity", help=help_text("severity")),
-            "vulnerable_population": st.column_config.CheckboxColumn("Vulnerable HH", help=help_text("vulnerable_population")),
-            "historical_backlog": st.column_config.NumberColumn("Backlog", help=help_text("historical_backlog")),
-        },
-        disabled=[
-            "ticket_id",
-            "created_at",
-            "district",
-            "ward",
-            "dept",
-            "category",
-            "pred_sla_breach_prob",
-            "priority_dynamic",
-            "historical_backlog",
-            "severity",
-            "vulnerable_population",
-        ],
-        key="queue_editor",
+        column_config=col_config,
+        disabled=["ticket_id", "created_at", "district", "pred_sla_breach_prob", "priority_dynamic"],
+        key="final_queue_editor_v2" 
     )
 
-    # Selection actions
-    sel = edited[edited["select"]]
-    st.caption(f"Selected: {len(sel)} ticket(s)")
+    # 6. Extract Selected Rows directly from the Editor Output
+    # This is the "Old Version" logic that works reliably
+    sel = edited_df[edited_df["select"]]
+    
+    # Show selection count
+    if len(sel) > 0:
+        st.success(f"✅ {len(sel)} tickets selected")
 
-    def build_payload(rows: pd.DataFrame) -> list[dict]:
-        from datetime import datetime
-        return [
-            {
+    # 7. Action Buttons
+    col_a, col_b, col_c = st.columns([1, 1, 2])
+    
+    if col_b.button("Assign Selected", disabled=len(sel) == 0, type="primary"):
+        for _, r in sel.iterrows():
+            payload = {
                 "ticket_id": r["ticket_id"],
                 "assignment": {
-                    "ministry": r["route_ministry"],
+                    "ministry": r["route_ministry"], 
                     "department": r["route_dept"],
-                    "escalated": bool(r["escalate"]),
+                    "escalated": bool(r["escalate"])
                 },
                 "status": "In Progress",
                 "assigned_at": datetime.now().isoformat(),
-                "priority_score": float(r["priority_dynamic"]),
                 "risk_score": float(r["pred_sla_breach_prob"]),
-                "metadata": {
-                    "district": r["district"],
-                    "ward": r["ward"],
-                    "category": r["category"],
-                    "severity": int(r["severity"]),
-                    "vulnerable_household": bool(r["vulnerable_population"]),
-                },
+                "priority_score": float(r["priority_dynamic"]),
+                # Metadata for dashboard
+                "ministry": r["route_ministry"],
+                "department": r["route_dept"]
             }
-            for _, r in rows.iterrows()
-        ]
+            # Save to Cloud
+            save_assignment_firestore(payload)
+        
+        st.success(f"✅ Successfully assigned {len(sel)} tickets! Data saved to Firestore.")
+        time.sleep(1) # Give DB time to write
+        st.rerun()
+        
+        # Optional: Clear history button logic logic can go here or be handled by manual uncheck
+        # Note: In this simple mode, boxes stay checked until user unchecks or reloads page
+        # This is often preferred behavior for batch operations.
 
-    if "assignments" not in st.session_state:
-        st.session_state["assignments"] = []
+    if col_c.button("Clear Selection"):
+        # This forces a cache clear to reset the editor
+        st.rerun()
 
-    col_a, col_b, col_c = st.columns([1, 1, 2])
-
-    col_a.download_button(
-        "Export Selection (CSV)",
-        sel.drop(columns=["select"]).to_csv(index=False).encode("utf-8"),
-        file_name="priority_tickets.csv",
-        mime="text/csv",
-        disabled=len(sel) == 0,
-        help="Download selected tickets as CSV file"
-    )
-
-    if col_b.button("Assign Selected Tickets", disabled=len(sel) == 0, type="primary", use_container_width=True):
-        payload = build_payload(sel)
-        st.session_state["assignments"].extend(payload)
-        st.success(f"Successfully assigned {len(sel)} ticket(s) to specified departments/ministries")
-        st.info("Navigate to 'Monitoring & Oversight' tab to track assigned tickets")
-
-    if col_c.button("Clear Assignment History", disabled=len(st.session_state["assignments"]) == 0):
-        st.session_state["assignments"] = []
-        st.info("Assignment history cleared")
-
-    # Assignment log
-    if st.session_state["assignments"]:
+    # Assignment Log
+    if "assignments" in st.session_state and st.session_state["assignments"]:
         st.markdown("---")
-        st.markdown(f"#### Assignment Log ({len(st.session_state['assignments'])} total assignments)")
-        recent = pd.DataFrame(st.session_state["assignments"]).tail(20).iloc[::-1]
-        st.dataframe(recent, hide_index=True, use_container_width=True, height=300)
+        st.markdown("### Assignment History")
+        st.dataframe(pd.DataFrame(st.session_state["assignments"]).tail(5))
+
+
 
 # ====== Tab 5: Monitoring & Oversight ======
 with tab5:
     st.subheader("Assignment Monitoring and Ministry Performance")
 
     # Get assigned tickets from session state
-    if "assignments" in st.session_state and len(st.session_state["assignments"]) > 0:
-        assigned_df = pd.DataFrame(st.session_state["assignments"])
+    assignments_data = get_assignments_firestore()
 
-        # Parse assignment data
-        assigned_df["ministry"] = assigned_df["assignment"].apply(lambda x: x["ministry"] if isinstance(x, dict) else "Unknown")
-        assigned_df["department"] = assigned_df["assignment"].apply(lambda x: x["department"] if isinstance(x, dict) else "Unknown")
+    if assignments_data and len(assignments_data) > 0:
+        assigned_df = pd.DataFrame(assignments_data)
+
+        # Handle potential missing columns if DB is fresh
+        if "ministry" not in assigned_df.columns:
+             assigned_df["ministry"] = assigned_df["assignment"].apply(lambda x: x.get("ministry", "Unknown") if isinstance(x, dict) else "Unknown")
+        if "department" not in assigned_df.columns:
+             assigned_df["department"] = assigned_df["assignment"].apply(lambda x: x.get("department", "Unknown") if isinstance(x, dict) else "Unknown")
+        
         assigned_df["assigned_at_dt"] = pd.to_datetime(assigned_df["assigned_at"])
 
         # Calculate time since assignment
@@ -1094,7 +1435,7 @@ with tab5:
                 "Avg Hours Since Assignment": "{:.1f}",
                 "Avg Risk Score": "{:.1%}"
             }),
-            use_container_width=True,
+            width='content',
             hide_index=True
         )
 
@@ -1114,7 +1455,7 @@ with tab5:
                 color_continuous_scale=["green", "yellow", "red"]
             )
             fig_ministry.update_layout(xaxis_tickangle=-45)
-            st.plotly_chart(fig_ministry, use_container_width=True, key="ministry_distribution_chart")
+            st.plotly_chart(fig_ministry, width='content', key="ministry_distribution_chart")
 
         with col2:
             st.markdown("#### Time Since Assignment")
@@ -1127,7 +1468,7 @@ with tab5:
                 color_continuous_scale=["green", "yellow", "red"]
             )
             fig_time.update_layout(xaxis_tickangle=-45)
-            st.plotly_chart(fig_time, use_container_width=True, key="ministry_response_time_chart")
+            st.plotly_chart(fig_time, width='content', key="ministry_response_time_chart")
 
         st.markdown("---")
 
@@ -1166,7 +1507,7 @@ with tab5:
                 "Priority": "{:.1f}",
                 "Hours Since Assignment": "{:.1f}"
             }),
-            use_container_width=True,
+            width='content',
             hide_index=True,
             height=400
         )
@@ -1188,4 +1529,59 @@ with tab5:
         """)
 
 st.markdown("---")
+
+# ====== Tab 6: Gemini Assistant ======
+with tab6:
+    st.subheader("🤖 GenAI Citizen & Officer Assistant (Powered by Vertex AI)")
+    
+    col_chat, col_context = st.columns([3, 1])
+    
+    with col_context:
+        st.info("ℹ️ **Live Context:** Connected to BigQuery & Vertex AI")
+        st.markdown(f"**Current Dataset:**")
+        st.markdown(f"- **Tickets:** {len(fdf)}")
+        st.markdown(f"- **Avg Risk:** {fdf['pred_sla_breach_prob'].mean():.1%}")
+        
+        # Dynamic top category based on filters
+        if not fdf.empty:
+            top_cat = fdf['category'].mode()[0]
+            st.markdown(f"- **Top Issue:** {top_cat}")
+            
+        st.markdown("---")
+        st.markdown("**Sample Queries:**")
+        st.code("Summarize critical water issues", language=None)
+        st.code("Which district has the highest risk?", language=None)
+        st.code("Draft an escalation email for the top risk ticket", language=None)
+
+    with col_chat:
+        # Create a fixed-height scrollable container for the history
+        chat_container = st.container(height=500, border=True)
+        
+        if "messages" not in st.session_state:
+            st.session_state.messages = []
+
+        # Render chat history INSIDE the container
+        with chat_container:
+            for message in st.session_state.messages:
+                with st.chat_message(message["role"]):
+                    st.markdown(message["content"])
+
+        # Input field stays OUTSIDE the container (at the bottom)
+        if prompt := st.chat_input("Ask Gemini about the filtered data..."):
+            # 1. Add user message to state
+            st.session_state.messages.append({"role": "user", "content": prompt})
+            
+            # 2. Render user message immediately in container
+            with chat_container:
+                st.chat_message("user").markdown(prompt)
+                
+                # 3. Generate and render response
+                with st.chat_message("assistant"):
+                    with st.spinner("Analyzing dashboard data..."):
+                        response = get_gemini_response(prompt, fdf)
+                        st.markdown(response)
+            
+            # 4. Add assistant response to state
+            st.session_state.messages.append({"role": "assistant", "content": response})
+
 st.caption("AI-Powered Governance Platform • Advanced Analytics for Public Service Management")

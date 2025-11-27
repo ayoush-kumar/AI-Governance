@@ -43,9 +43,7 @@ def synthesize(base_dir, n=5000, days=180, seed=42):
     np.random.seed(seed)
     random.seed(seed)
     
-    # Generate data from last 180 days (May 30 to Nov 26, 2025)
-    end_date = datetime(2025, 11, 26)  # Current date
-    start_date = end_date - timedelta(days=days)
+    start_date = datetime.today() - timedelta(days=days)
 
     districts = ["Mumbai City","Mumbai Suburban","Pune","Thane","Nagpur","Nashik","Aurangabad","Solapur","Amravati","Kolhapur"]
     wards = [f"W{str(i).zfill(2)}" for i in range(1, 31)]
@@ -273,7 +271,7 @@ def synthesize(base_dir, n=5000, days=180, seed=42):
     # Verify time distribution
     df_temp = df.copy()
     df_temp['created_dt'] = pd.to_datetime(df_temp['created_at'])
-    df_temp['days_ago'] = (end_date - df_temp['created_dt']).dt.days
+    df_temp['days_ago'] = (datetime.today() - df_temp['created_dt']).dt.days
     recent_count = len(df_temp[df_temp['days_ago'] <= 30])
     older_count = len(df_temp[df_temp['days_ago'] > 30])
     
